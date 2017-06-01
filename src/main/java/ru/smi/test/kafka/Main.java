@@ -5,9 +5,10 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.text.DecimalFormat;
 import java.util.Collections;
-import java.util.Iterator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -31,12 +32,19 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.clients.consumer.internals.AbstractCoordinator;
 import org.apache.kafka.clients.consumer.internals.ConsumerCoordinator;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.protocol.SecurityProtocol;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import ru.smi.test.kafka.deserializer.BoonDeserializer;
+import ru.smi.test.kafka.deserializer.FastJsonDeserializer;
+import ru.smi.test.kafka.deserializer.GsonDeserializer;
+import ru.smi.test.kafka.deserializer.JacksonDeserializer;
 
 public class Main {
 
@@ -57,6 +65,8 @@ public class Main {
     private static final Option STATS_INTERVAL = Option.builder().longOpt("stats-interval").hasArg(true).required(false).numberOfArgs(1).type(Number.class)
             .build();
     private static final Option CONFIG = Option.builder().longOpt("config").hasArg(true).required(false).numberOfArgs(1).build();
+    private static final Option KEY_DESERIALIZER = Option.builder().longOpt("key-deserializer").hasArg(true).required(false).numberOfArgs(1).build();
+    private static final Option VALUE_DESERIALIZER = Option.builder().longOpt("value-deserializer").hasArg(true).required(false).numberOfArgs(1).build();
 
     private static final Options OPTIONS = new Options() {
 
@@ -70,6 +80,8 @@ public class Main {
             addOption(POLL_TIMEOUT);
             addOption(STATS_INTERVAL);
             addOption(CONFIG);
+            addOption(KEY_DESERIALIZER);
+            addOption(VALUE_DESERIALIZER);
         }
     };
 
@@ -91,6 +103,7 @@ public class Main {
     }
 
     private static final AtomicLong totalMessages = new AtomicLong(0);
+    private static final AtomicLong totalMillis = new AtomicLong(0);
     private static final AtomicReference<Double> minSpeed = new AtomicReference<>(Double.MAX_VALUE);
     private static final AtomicReference<Double> maxSpeed = new AtomicReference<>(0.0);
     private static final AtomicInteger iterationCount = new AtomicInteger(0);
@@ -116,7 +129,13 @@ public class Main {
         }
         properties.put("bootstrap.servers", commandLine.getOptionValue(BOOTSTRAP_SERVERS.getLongOpt()));
         properties.put("group.id", commandLine.getOptionValue(GROUP.getLongOpt()));
-        KafkaConsumer consumer = createConsumer(properties);
+
+        final String keyDeserializer = commandLine.hasOption(KEY_DESERIALIZER.getLongOpt()) ? commandLine.getOptionValue(KEY_DESERIALIZER.getLongOpt()) :
+                "bytes";
+        final String valueDeserializer = commandLine.hasOption(VALUE_DESERIALIZER.getLongOpt()) ? commandLine.getOptionValue(VALUE_DESERIALIZER.getLongOpt()) :
+                "bytes";
+
+        KafkaConsumer consumer = createConsumer(keyDeserializer, valueDeserializer, properties);
 
         final String topicName = commandLine.getOptionValue(TOPIC.getLongOpt());
         final int pollTimeout = getValue(commandLine, POLL_TIMEOUT, 500);
@@ -132,18 +151,36 @@ public class Main {
             //nothing to do
         }
         executor.shutdown();
-        log.info("Total messages: {}", totalMessages.get());
+        log.info("Total: messages={}, seconds={}", totalMessages.get(), df.format(totalMillis.get() / 1000.0));
         log.info("nMsgs/sec: min={}, max={}, avg={}", df.format(minSpeed.get()), df.format(maxSpeed.get()), df.format(totalSpeed.get() / iterationCount
                 .decrementAndGet()));
         log.info("...exit");
     }
 
-    private static KafkaConsumer createConsumer(Properties properties) {
+    private static KafkaConsumer createConsumer(final String keyDeserializer, final String valueDeserializer, Properties properties) {
         properties.put("security.protocol", SecurityProtocol.PLAINTEXT.name);
         properties.put("enable.auto.commit", "false");
         properties.put("auto.offset.reset", OffsetResetStrategy.EARLIEST.name().toLowerCase());
-        KafkaConsumer consumer = new KafkaConsumer<>(properties, new ByteArrayDeserializer(), new ByteArrayDeserializer());
+        KafkaConsumer consumer = new KafkaConsumer<>(properties, createKeyDeserializer(keyDeserializer), createValueDeserializer(valueDeserializer));
         return consumer;
+    }
+
+    private static Deserializer createKeyDeserializer(final String deserializer) {
+        switch (deserializer) {
+            case "string" : return new StringDeserializer();
+            default : return new ByteArrayDeserializer();
+        }
+    }
+
+    private static Deserializer createValueDeserializer(final String deserializer) {
+        log.info("Deserializer type: {}", deserializer);
+        switch (deserializer) {
+            case "jackson" : return new JacksonDeserializer();
+            case "boon" : return new BoonDeserializer();
+            case "gson" : return new GsonDeserializer();
+            case "fastjson" : return new FastJsonDeserializer();
+            default: return new ByteArrayDeserializer();
+        }
     }
 
     private static CommandLine parseArgs(String... args) {
@@ -218,20 +255,39 @@ public class Main {
                         continue;
                     }
                     retryCount = 0;
-                    Iterator<ConsumerRecord> iterator = records.iterator();
-                    while(iterator.hasNext()) {
-                        iterator.next();
-                        messageCount += 1;
-                        if (messageCount % statsInterval == 0) {
-                            print(messageCount, System.currentTimeMillis() - start);
-                            if (totalMessages.get() >= maxMessages) {
-                                closed.set(true);
-                                break;
+                    Set<TopicPartition> partitions = records.partitions();
+                    for (TopicPartition topicPartition : partitions) {
+                        List<ConsumerRecord> list = records.records(topicPartition);
+                        for (ConsumerRecord record : list) {
+                            messageCount += 1;
+                            if (messageCount % statsInterval == 0) {
+                                print(messageCount, System.currentTimeMillis() - start);
+                                if (totalMessages.get() >= maxMessages) {
+                                    closed.set(true);
+                                    break;
+                                }
+                                start = System.currentTimeMillis();
+                                messageCount = 0;
                             }
-                            start = System.currentTimeMillis();
-                            messageCount = 0;
+                        }
+                        if (closed.get()) {
+                            break;
                         }
                     }
+//                    Iterator<ConsumerRecord> iterator = records.iterator();
+//                    while(iterator.hasNext()) {
+//                        iterator.next();
+//                        messageCount += 1;
+//                        if (messageCount % statsInterval == 0) {
+//                            print(messageCount, System.currentTimeMillis() - start);
+//                            if (totalMessages.get() >= maxMessages) {
+//                                closed.set(true);
+//                                break;
+//                            }
+//                            start = System.currentTimeMillis();
+//                            messageCount = 0;
+//                        }
+//                    }
                 }
                 log.info("...finished...");
             } catch (WakeupException exc) {
@@ -255,6 +311,7 @@ public class Main {
             double speed = messageCount/elapsedSecs;
             totalMessages.getAndAdd(messageCount);
             log.info("nMsgs: {}, ms: {}, nMsgs/sec: {}", totalMessages.get(), elapsedTime, df.format(speed));
+            totalMillis.getAndAdd(elapsedTime);
             iterationCount.getAndIncrement();
             if (iterationCount.get() > 1) {
                 totalSpeed.set(totalSpeed.get() + speed);
